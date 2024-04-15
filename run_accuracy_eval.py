@@ -8,20 +8,47 @@ import matplotlib.pyplot as plt
 
 import gpupoor.kernels.matmul as mm
 
+try:
+    import gemm_streamk_transpose
+except:
+    pass
+
+try:
+    import gemm_splitk_transpose
+except:
+    pass
+
+
+def to_col_major(x: torch.Tensor) -> torch.Tensor:
+    K, N = x.shape
+    x = x.T.contiguous()
+    x = x.set_(x.untyped_storage(), x.storage_offset(), (K, N), (N, 1))
+    return x
+
+
 EPS: float = 1e-6
 M_MIN: int = 512
 N_MIN: int = 256
 
 KERNEL_MAP = {
     "split_k_sequential": mm.split_k_sequential,
-    "cascaded": mm.cascaded,
+    # "split_k_parallel": mm.split_k_parallel,
+    # "cascaded": mm.cascaded,
+    "cutlass_stream_k": gemm_streamk_transpose.run if gemm_streamk_transpose else None,
+    "cutlass_split_k": gemm_splitk_transpose.run if gemm_splitk_transpose else None,
 }
+
+
+def get_rand_fn(name: str):
+    assert name in ["randn", "rand"], f"Invalid rand_fn: {name}"
+    return getattr(torch, name)
 
 
 def main(
     kernel_name: str,
     metric: str = "delta",
-    plot_type: str = "violin",
+    plot_type: str = "box",
+    rand_fn: str = "randn",
     M: int = 1,
     N: int = 4096,
     K: int = 14336,
@@ -32,28 +59,41 @@ def main(
     group_size: list[int] = [32, 128, 512],
 ):
     kernel = KERNEL_MAP[kernel_name]
+    assert kernel is not None, f"Kernel {kernel_name} failed to load."
 
     if seed is not None:
         torch.manual_seed(seed)
 
     M_, N_ = max(M, M_MIN), max(N, N_MIN)
 
-    A = torch.randn(M_, K, device="cuda", dtype=torch.float16)
-    B = torch.randn(K, N_, device="cuda", dtype=torch.float16)
+    _rand_fn = get_rand_fn(rand_fn)
+    A = _rand_fn(M_, K, device="cuda", dtype=torch.float16)
+    B = _rand_fn(K, N_, device="cuda", dtype=torch.float16)
     fp64_out = A.double() @ B.double()
 
-    print(f"{kernel.__name__} :: {M}x{N}x{K}")
+    print(f"{kernel_name} :: {M}x{N}x{K}")
     fp16_outs = []
     match kernel_name:
         case "split_k_sequential":
             for kdiv in k_acc_div_max:
+                kwargs = dict(k_acc_div_max=kdiv, bias=None, out=None, activation=None, dump_ptx=False)
                 print(f"\t{kdiv=}")
-                fp16_outs.append(kernel(A, B, k_acc_div_max=kdiv))
+                fp16_outs.append(kernel(A, B, **kwargs))
 
         case "cascaded":
             for grp_sz in group_size:
+                kwargs = dict(grp_sz=grp_sz)
                 print(f"\t{grp_sz=}")
-                fp16_outs.append(kernel(A, B, group_size=grp_sz))
+                fp16_outs.append(kernel(A, B, **kwargs))
+
+        case "cutlass_stream_k":
+            kwargs = dict()
+            fp16_outs.append(kernel(A, to_col_major(B), **kwargs))
+
+        case "cutlass_split_k":
+            for kdiv in k_acc_div_max:
+                kwargs = dict(split_k_slices=kdiv)
+                fp16_outs.append(kernel(A, to_col_major(B), **kwargs))
 
     fp32_out = A @ B
 
@@ -67,6 +107,10 @@ def main(
             samples += [(f"fp16 ({kdiv=})", out) for kdiv, out in zip(k_acc_div_max, fp16_outs)]
         case "cascaded":
             samples += [(f"fp16 ({grp_sz=})", out) for grp_sz, out in zip(group_size, fp16_outs)]
+        case "cutlass_stream_k":
+            samples += [("fp16 (streamK)", fp16_outs[0])]
+        case "cutlass_split_k":
+            samples += [(f"fp16 (splitK={kdiv})", out) for kdiv, out in zip(k_acc_div_max, fp16_outs)]
     samples.append(("fp32", fp32_out))
 
     metrics = defaultdict(dict)
@@ -116,7 +160,7 @@ def main(
 
     plt.grid(alpha=0.25)
     plt.tight_layout()
-    filename = f"{kernel.__name__}__error_{M}x{N}x{K}.png"
+    filename = f"{kernel_name}__error_{M}x{N}x{K}.png"
     plt.savefig(filename, dpi=200)
     print(f"Saved {filename}")
 

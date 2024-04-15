@@ -9,20 +9,14 @@ K_ACC_DIV_MIN = 1
 
 VALUES_BLOCK_M = [128, 256]
 VALUES_BLOCK_N = [128]
-VALUES_BLOCK_K = [32]  # Do not change this value
-VALUES_GROUP_M = [8]
-VALUES_NUM_STAGES = [4]
-VALUES_NUM_WARPS = [8]
+VALUES_BLOCK_K = [16, 32]
+VALUES_GROUP_M = [4, 8]
+VALUES_NUM_STAGES = [3, 4, 5]
+VALUES_NUM_WARPS = [4, 8]
 
-M_MIN, N_MIN = 256, 128
+M_MIN, N_MIN = 512, 256
 assert M_MIN >= min(VALUES_BLOCK_M)
 assert N_MIN >= min(VALUES_BLOCK_N)
-assert VALUES_BLOCK_K == [32]
-
-
-def calculate_k_acc_div(K, BLOCK_K, K_ACC_DIV) -> int:
-    ret = triton.next_power_of_2(int((K // BLOCK_K) ** 0.5))
-    return min(max(ret, K_ACC_DIV_MIN), K_ACC_DIV)
 
 
 @triton.jit
@@ -42,6 +36,7 @@ def silu(x: tl.tensor) -> tl.tensor:
                 {
                     "BLOCK_M": BLOCK_M,
                     "BLOCK_N": BLOCK_N,
+                    "BLOCK_K": BLOCK_K,
                     "GROUP_M": GROUP_M,
                 },
                 num_stages=num_stages,
@@ -49,6 +44,7 @@ def silu(x: tl.tensor) -> tl.tensor:
             )
             for BLOCK_M in VALUES_BLOCK_M
             for BLOCK_N in VALUES_BLOCK_N
+            for BLOCK_K in VALUES_BLOCK_K
             for GROUP_M in VALUES_GROUP_M
             for num_stages in VALUES_NUM_STAGES
             for num_warps in VALUES_NUM_WARPS
@@ -72,18 +68,18 @@ def _matmul_kernel(
     stride_cm: int,
     stride_cn: int,
     inner_acc_dtype: tl.constexpr,
-    outer_acc_dtype: tl.constexpr,
+    SPLIT_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
-    K_ACC_DIV: tl.constexpr,
-    K_IS_DIVISIBLE: tl.constexpr,
     ACTIVATION: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
     """
+
+    # TODO: Replace with tl.swizzle2d
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -94,11 +90,15 @@ def _matmul_kernel(
     pid_m = first_pid_m + (pid % GROUP_M)
     pid_n = (pid % num_pid_in_group) // GROUP_M
 
+    K_BLOCKS = tl.cdiv(K, BLOCK_K * SPLIT_K)
+
+    pid_k = tl.program_id(axis=1)
+
     a_block_ptr = tl.make_block_ptr(
         base=a_ptr,
         shape=(M, K),
         strides=(stride_am, stride_ak),
-        offsets=(pid_m * BLOCK_M, 0),
+        offsets=(pid_m * BLOCK_M, pid_k * K_BLOCKS),
         block_shape=(BLOCK_M, BLOCK_K),
         order=(0, 1),
     )
@@ -107,84 +107,71 @@ def _matmul_kernel(
         base=b_ptr,
         shape=(K, N),
         strides=(stride_bk, stride_bn),
-        offsets=(0, pid_n * BLOCK_N),
+        offsets=(pid_k * K_BLOCKS, pid_n * BLOCK_N),
         block_shape=(BLOCK_K, BLOCK_N),
         order=(0, 1),
     )
 
-    out = tl.zeros((BLOCK_M, BLOCK_N), dtype=outer_acc_dtype)
-
-    k_inner = tl.cdiv(K, BLOCK_K) // K_ACC_DIV
-
-    for k_i in range(0, K_ACC_DIV):
-        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=inner_acc_dtype)
-        for k in range(0, k_inner):
-            if K_IS_DIVISIBLE:
-                a = tl.load(a_block_ptr)
-                b = tl.load(b_block_ptr)
-            else:
-                a = tl.load(a_block_ptr, boundary_check=(0, 1))
-                b = tl.load(b_block_ptr, boundary_check=(1, 0))
-
-            accumulator = tl.dot(a, b, acc=accumulator, out_dtype=inner_acc_dtype)
-
-            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
-
-        out += accumulator.to(outer_acc_dtype)
+    out = tl.zeros((BLOCK_M, BLOCK_N), dtype=inner_acc_dtype)
 
     if bias_ptr is not None:
-        bias_block_ptr = tl.make_block_ptr(
-            base=bias_ptr,
-            shape=(1, BLOCK_N),
-            strides=(0, 1),
-            offsets=(0, pid_n * BLOCK_N),
-            block_shape=(1, BLOCK_N),
-            order=(0, 1),
-        )
-        out += tl.load(bias_block_ptr, boundary_check=(0, 1)).to(outer_acc_dtype)
+        if pid_k == 0:
+            bias_block_ptr = tl.make_block_ptr(
+                base=bias_ptr,
+                shape=(1, BLOCK_N),
+                strides=(0, 1),
+                offsets=(0, pid_n * BLOCK_N),
+                block_shape=(1, BLOCK_N),
+                order=(0, 1),
+            )
+            out += tl.load(bias_block_ptr, boundary_check=(0, 1)).to(inner_acc_dtype)
 
-    """
+    # Needed?
+    # tl.debug_barrier()
+
+    for k in range(0, K_BLOCKS):
+        a = tl.load(a_block_ptr, boundary_check=(0, 1))
+        b = tl.load(b_block_ptr, boundary_check=(1, 0))
+
+        out = tl.dot(a, b, acc=out, out_dtype=inner_acc_dtype)
+
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+
     if ACTIVATION == "relu":
         out = relu(out)
-    elif ACTIVATION == "gelu":
-        out = gelu(out)
+    # elif ACTIVATION == "gelu":
+    #    out = gelu(out)
     elif ACTIVATION == "silu":
         out = silu(out)
-    """
 
     out = out.to(c_ptr.dtype.element_ty)
 
-    c_block_ptr = tl.make_block_ptr(
-        base=c_ptr,
-        shape=(M, N),
-        strides=(stride_cm, stride_cn),
-        offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
-        block_shape=(BLOCK_M, BLOCK_N),
-        order=(1, 0),
-    )
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-    tl.store(c_block_ptr, out, boundary_check=(0, 1))
+    tl.atomic_add(c_ptrs, out, mask=c_mask)
 
 
 torch.library.Library("gpu_poor", "DEF")
 
 
 @torch.library.custom_op(
-    "gpu_poor::split_k_sequential",
+    "gpu_poor::split_k_parallel",
     mutates_args={"out"},
     # device_types=("cuda",),
 )
-def _split_k_sequential(
+def _split_k_parallel(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: Optional[torch.Tensor],
     out: Optional[torch.Tensor],
     dump_ptx: bool,
-    k_acc_div_max: int,
+    k_acc_div_max: Optional[int],
     activation: Optional[str],
 ) -> torch.Tensor:
-    assert activation is None, "Activation not supported yet"
     # a = a.contiguous()
     # b = b.contiguous()
     assert a.ndim == 2 and b.ndim == 2, "Input tensors must have 2 dimensions"
@@ -203,14 +190,18 @@ def _split_k_sequential(
     a = a.reshape(M, K)
 
     if out is None:
-        out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        out = torch.zeros((M, N), device=a.device, dtype=a.dtype)
+    else:
+        raise NotImplementedError("Output tensor is not supported yet")
+
+    if k_acc_div_max is None:
+        k_acc_div_max = triton.next_power_of_2(int((K // 32) ** 0.5))
 
     def grid(meta: dict):
-        return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
-
-    K_ACC_DIV = calculate_k_acc_div(K, VALUES_BLOCK_K[0], k_acc_div_max)
-    # print(f"{a.shape=} {b.shape=} K_ACC_DIV: {K_ACC_DIV}")
-    K_IS_DIVISIBLE = K % (VALUES_BLOCK_K[0] * K_ACC_DIV) == 0
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+            k_acc_div_max,
+        )
 
     kernel = _matmul_kernel[grid](
         a,
@@ -227,10 +218,7 @@ def _split_k_sequential(
         out.stride(0),
         out.stride(1),
         inner_acc_dtype=tl.float16,
-        outer_acc_dtype=tl.float32,
-        K_ACC_DIV=K_ACC_DIV,
-        K_IS_DIVISIBLE=K_IS_DIVISIBLE,
-        BLOCK_K=VALUES_BLOCK_K[0],
+        SPLIT_K=k_acc_div_max,
         ACTIVATION=activation,
     )
 
@@ -240,8 +228,8 @@ def _split_k_sequential(
     return out.reshape(*batch_dims, N)
 
 
-@_split_k_sequential.register_fake
-def _split_k_sequential_abstract(
+@_split_k_parallel.register_fake
+def _split_k_parallel_abstract(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: Optional[torch.Tensor],
@@ -267,8 +255,8 @@ def _split_k_sequential_abstract(
     return torch.empty((m, n), dtype=a.dtype, device=a.device)
 
 
-@register_flop_formula(torch.ops.gpu_poor.split_k_sequential)
-def split_k_sequential_flop(a_shape, b_shape, bias_shape, *args, **kwargs) -> int:
+@register_flop_formula(torch.ops.gpu_poor.split_k_parallel)
+def split_k_parallel_flop(a_shape, b_shape, bias_shape, *args, **kwargs) -> int:
     """Count flops for matmul."""
     m, k, n = *a_shape, b_shape[-1]
     flops = 2 * m * n * (k - 1)
@@ -277,6 +265,6 @@ def split_k_sequential_flop(a_shape, b_shape, bias_shape, *args, **kwargs) -> in
     return flops
 
 
-flop_registry[torch.ops.gpu_poor.split_k_sequential] = split_k_sequential_flop
+flop_registry[torch.ops.gpu_poor.split_k_parallel] = split_k_parallel_flop
 
-split_k_sequential = torch.ops.gpu_poor.split_k_sequential
+split_k_parallel = torch.ops.gpu_poor.split_k_parallel

@@ -1,7 +1,7 @@
 [project]
 name = "gpupoor"
 version = "0.1.0"
-description = "For the poor GPU users."
+description = "Accelerated training/inference for the GPU-poor."
 authors = [{ name = "sekstini", email = "sekstinilol@gmail.com" }]
 readme = "README.md"
 license = { text = "MIT License" }
