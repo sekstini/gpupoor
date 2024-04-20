@@ -6,7 +6,7 @@ import triton.language as tl
 import numpy as np
 import matplotlib.pyplot as plt
 
-import gpupoor.kernels.matmul as mm
+import gpu_poor.kernels.matmul as mm
 
 try:
     import gemm_streamk_transpose
@@ -32,8 +32,6 @@ N_MIN: int = 256
 
 KERNEL_MAP = {
     "split_k_sequential": mm.split_k_sequential,
-    # "split_k_parallel": mm.split_k_parallel,
-    # "cascaded": mm.cascaded,
     "cutlass_stream_k": gemm_streamk_transpose.run if gemm_streamk_transpose else None,
     "cutlass_split_k": gemm_splitk_transpose.run if gemm_splitk_transpose else None,
 }
@@ -55,8 +53,6 @@ def main(
     seed: int | None = None,
     # split k sequential options
     k_acc_div_max: list[int] = [1, 2, 4, 8, 16, 32],
-    # cascaded options
-    group_size: list[int] = [32, 128, 512],
 ):
     kernel = KERNEL_MAP[kernel_name]
     assert kernel is not None, f"Kernel {kernel_name} failed to load."
@@ -80,12 +76,6 @@ def main(
                 print(f"\t{kdiv=}")
                 fp16_outs.append(kernel(A, B, **kwargs))
 
-        case "cascaded":
-            for grp_sz in group_size:
-                kwargs = dict(grp_sz=grp_sz)
-                print(f"\t{grp_sz=}")
-                fp16_outs.append(kernel(A, B, **kwargs))
-
         case "cutlass_stream_k":
             kwargs = dict()
             fp16_outs.append(kernel(A, to_col_major(B), **kwargs))
@@ -105,8 +95,6 @@ def main(
     match kernel_name:
         case "split_k_sequential":
             samples += [(f"fp16 ({kdiv=})", out) for kdiv, out in zip(k_acc_div_max, fp16_outs)]
-        case "cascaded":
-            samples += [(f"fp16 ({grp_sz=})", out) for grp_sz, out in zip(group_size, fp16_outs)]
         case "cutlass_stream_k":
             samples += [("fp16 (streamK)", fp16_outs[0])]
         case "cutlass_split_k":

@@ -3,7 +3,7 @@ from functools import partial
 import torch
 import triton
 
-import gpupoor.kernels.matmul as mm
+import gpu_poor.kernels.matmul as mm
 
 try:
     import gemm_streamk_transpose
@@ -15,11 +15,13 @@ try:
 except:
     gemm_splitk_transpose = None
 
+
 def to_col_major(x: torch.Tensor) -> torch.Tensor:
     K, N = x.shape
     x = x.T.contiguous()
     x = x.set_(x.untyped_storage(), x.storage_offset(), (K, N), (N, 1))
     return x
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -33,11 +35,14 @@ def to_col_major(x: torch.Tensor) -> torch.Tensor:
             "triton_16",
             "triton_4",
             "triton_1",
-            *([
-            "cutlass_splitK_16",
-            "cutlass_splitK_4",
-            "cutlass_splitK_1",
-            ] * (gemm_splitk_transpose is not None)),
+            *(
+                [
+                    "cutlass_splitK_16",
+                    "cutlass_splitK_4",
+                    "cutlass_splitK_1",
+                ]
+                * (gemm_splitk_transpose is not None)
+            ),
             *(["cutlass_streamK"] * (gemm_streamk_transpose is not None)),
         ],
         # Label name for the lines
@@ -46,28 +51,30 @@ def to_col_major(x: torch.Tensor) -> torch.Tensor:
             "Triton (fp16 acc, kdiv=32)",
             "Triton (fp16 acc, kdiv=8)",
             "Triton (fp16 acc, kdiv=1)",
-            *([
-            "CUTLASS (fp16 acc, splitK=32)",
-            "CUTLASS (fp16 acc, splitK=8)",
-            "CUTLASS (fp16 acc, splitK=1)",
-            ] * (gemm_splitk_transpose is not None)),
+            *(
+                [
+                    "CUTLASS (fp16 acc, splitK=32)",
+                    "CUTLASS (fp16 acc, splitK=8)",
+                    "CUTLASS (fp16 acc, splitK=1)",
+                ]
+                * (gemm_splitk_transpose is not None)
+            ),
             *(["CUTLASS (fp16 acc, streamK)"] * (gemm_streamk_transpose is not None)),
         ],
         # Line styles
         styles=[
             ("green", "--"),
-
             ("orange", "-"),
             ("purple", "-"),
             ("blue", "-"),
-
-            *([
-            ("orange", ":"),
-            ("purple", ":"),
-            ("blue", ":"),
-
-            ] * (gemm_splitk_transpose is not None)),
-
+            *(
+                [
+                    ("orange", ":"),
+                    ("purple", ":"),
+                    ("blue", ":"),
+                ]
+                * (gemm_splitk_transpose is not None)
+            ),
             *([("red", ":")] * (gemm_streamk_transpose is not None)),
         ],
         ylabel="TFLOP/s",  # Label name for the y-axis

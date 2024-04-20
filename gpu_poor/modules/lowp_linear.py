@@ -3,10 +3,11 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-import gpupoor.kernels.matmul.split_k_sequential
+import gpu_poor.kernels.matmul.split_k_sequential
 
 
 K_ACC_DIV_MAX = int(os.getenv("K_ACC_DIV_MAX", "32"))
+
 
 class LowPrecisionLinearFunction(torch.autograd.Function):
     @staticmethod
