@@ -6,17 +6,7 @@ import triton.language as tl
 import numpy as np
 import matplotlib.pyplot as plt
 
-import gpu_poor.kernels.matmul as mm
-
-try:
-    import gemm_streamk_transpose
-except:
-    pass
-
-try:
-    import gemm_splitk_transpose
-except:
-    pass
+import gpu_poor.kernels as mm
 
 
 def to_col_major(x: torch.Tensor) -> torch.Tensor:
@@ -32,8 +22,6 @@ N_MIN: int = 256
 
 KERNEL_MAP = {
     "split_k_sequential": mm.split_k_sequential,
-    "cutlass_stream_k": gemm_streamk_transpose.run if gemm_streamk_transpose else None,
-    "cutlass_split_k": gemm_splitk_transpose.run if gemm_splitk_transpose else None,
 }
 
 
@@ -52,7 +40,7 @@ def main(
     K: int = 14336,
     seed: int | None = None,
     # split k sequential options
-    k_acc_div_max: list[int] = [1, 2, 4, 8, 16, 32],
+    k_acc_div_max: list[int] = [1, 2, 4, 8, 16],
 ):
     kernel = KERNEL_MAP[kernel_name]
     assert kernel is not None, f"Kernel {kernel_name} failed to load."
@@ -65,15 +53,18 @@ def main(
     _rand_fn = get_rand_fn(rand_fn)
     A = _rand_fn(M_, K, device="cuda", dtype=torch.float16)
     B = _rand_fn(K, N_, device="cuda", dtype=torch.float16)
+
+    B.mul_(0.1)
+
     fp64_out = A.double() @ B.double()
 
     print(f"{kernel_name} :: {M}x{N}x{K}")
     fp16_outs = []
     match kernel_name:
         case "split_k_sequential":
-            for kdiv in k_acc_div_max:
-                kwargs = dict(k_acc_div_max=kdiv, bias=None, out=None, activation=None, dump_ptx=False)
-                print(f"\t{kdiv=}")
+            for max_k_splits in k_acc_div_max:
+                kwargs = dict(max_k_splits=max_k_splits, bias=None)
+                print(f"\t{max_k_splits=}")
                 fp16_outs.append(kernel(A, B, **kwargs))
 
         case "cutlass_stream_k":
@@ -94,7 +85,7 @@ def main(
     samples = []
     match kernel_name:
         case "split_k_sequential":
-            samples += [(f"fp16 ({kdiv=})", out) for kdiv, out in zip(k_acc_div_max, fp16_outs)]
+            samples += [(f"fp16 ({max_k_splits=})", out) for max_k_splits, out in zip(k_acc_div_max, fp16_outs)]
         case "cutlass_stream_k":
             samples += [("fp16 (streamK)", fp16_outs[0])]
         case "cutlass_split_k":

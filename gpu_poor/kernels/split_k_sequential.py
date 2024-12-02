@@ -3,36 +3,19 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-from torch.utils.flop_counter import register_flop_formula, flop_registry
-
-K_ACC_DIV_MIN = 1
+from torch.utils.flop_counter import flop_registry, register_flop_formula
 
 VALUES_BLOCK_M = [128, 256]
-VALUES_BLOCK_N = [128]
-VALUES_BLOCK_K = [32]  # Do not change this value
-VALUES_GROUP_M = [8]
-VALUES_NUM_STAGES = [4]
-VALUES_NUM_WARPS = [8]
-
-M_MIN, N_MIN = 256, 128
-assert M_MIN >= min(VALUES_BLOCK_M)
-assert N_MIN >= min(VALUES_BLOCK_N)
-assert VALUES_BLOCK_K == [32]
+VALUES_BLOCK_N = [64, 128]
+VALUES_BLOCK_K = [32, 64]  # Do not change this value
+VALUES_GROUP_M = [2, 8]
+VALUES_NUM_STAGES = [4, 5]
+VALUES_NUM_WARPS = [4, 8]
 
 
-def calculate_k_acc_div(K, BLOCK_K, K_ACC_DIV) -> int:
-    ret = triton.next_power_of_2(int((K // BLOCK_K) ** 0.5))
-    return min(max(ret, K_ACC_DIV_MIN), K_ACC_DIV)
-
-
-@triton.jit
-def relu(x: tl.tensor) -> tl.tensor:
-    return tl.where(x > 0, x, tl.zeros(x.shape, dtype=x.dtype))
-
-
-@triton.jit
-def silu(x: tl.tensor) -> tl.tensor:
-    return x * tl.sigmoid(x)
+def calculate_k_acc_div(k: int, block_k: int, k_acc_div_max: int) -> int:
+    k_div = triton.next_power_of_2(int((k / block_k) ** 0.5))
+    return max(1, min(k_div, k_acc_div_max))
 
 
 @triton.autotune(
@@ -61,7 +44,7 @@ def _matmul_kernel(
     a_ptr: tl.tensor,
     b_ptr: tl.tensor,
     c_ptr: tl.tensor,
-    bias_ptr: Optional[tl.tensor],
+    bias_ptr: tl.tensor,
     M: int,
     N: int,
     K: int,
@@ -71,6 +54,7 @@ def _matmul_kernel(
     stride_bn: int,
     stride_cm: int,
     stride_cn: int,
+    compute_dtype: tl.constexpr,
     inner_acc_dtype: tl.constexpr,
     outer_acc_dtype: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -79,7 +63,6 @@ def _matmul_kernel(
     GROUP_M: tl.constexpr,
     K_ACC_DIV: tl.constexpr,
     K_IS_DIVISIBLE: tl.constexpr,
-    ACTIVATION: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -109,12 +92,12 @@ def _matmul_kernel(
         strides=(stride_bk, stride_bn),
         offsets=(0, pid_n * BLOCK_N),
         block_shape=(BLOCK_K, BLOCK_N),
-        order=(0, 1),
+        order=(1, 0),
     )
 
     out = tl.zeros((BLOCK_M, BLOCK_N), dtype=outer_acc_dtype)
 
-    k_inner = tl.cdiv(K, BLOCK_K) // K_ACC_DIV
+    k_inner = tl.cdiv(K, BLOCK_K * K_ACC_DIV)
 
     for k_i in range(0, K_ACC_DIV):
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=inner_acc_dtype)
@@ -124,8 +107,9 @@ def _matmul_kernel(
                 b = tl.load(b_block_ptr)
             else:
                 a = tl.load(a_block_ptr, boundary_check=(0, 1))
-                b = tl.load(b_block_ptr, boundary_check=(1, 0))
+                b = tl.load(b_block_ptr, boundary_check=(0, 1))
 
+            a, b = a.to(compute_dtype), b.to(compute_dtype)
             accumulator = tl.dot(a, b, acc=accumulator, out_dtype=inner_acc_dtype)
 
             a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
@@ -142,16 +126,7 @@ def _matmul_kernel(
             block_shape=(1, BLOCK_N),
             order=(0, 1),
         )
-        out += tl.load(bias_block_ptr, boundary_check=(0, 1)).to(outer_acc_dtype)
-
-    """
-    if ACTIVATION == "relu":
-        out = relu(out)
-    elif ACTIVATION == "gelu":
-        out = gelu(out)
-    elif ACTIVATION == "silu":
-        out = silu(out)
-    """
+        out += tl.load(bias_block_ptr, boundary_check=(1,)).to(outer_acc_dtype)
 
     out = out.to(c_ptr.dtype.element_ty)
 
@@ -161,58 +136,43 @@ def _matmul_kernel(
         strides=(stride_cm, stride_cn),
         offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
         block_shape=(BLOCK_M, BLOCK_N),
-        order=(1, 0),
+        order=(0, 1),
     )
 
     tl.store(c_block_ptr, out, boundary_check=(0, 1))
 
 
-torch.library.Library("gpu_poor", "DEF")
-
-
 @torch.library.custom_op(
-    "gpu_poor::split_k_sequential",
-    mutates_args={"out"},
-    # device_types=("cuda",),
+    "gpu_poor::_split_k_sequential",
+    mutates_args={},
 )
 def _split_k_sequential(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: Optional[torch.Tensor],
-    out: Optional[torch.Tensor],
-    dump_ptx: bool,
     k_acc_div_max: int,
-    activation: Optional[str],
 ) -> torch.Tensor:
-    assert activation is None, "Activation not supported yet"
     # a = a.contiguous()
     # b = b.contiguous()
     assert a.ndim == 2 and b.ndim == 2, "Input tensors must have 2 dimensions"
     assert a.shape[-1] == b.shape[-2], f"Incompatible dimensions: {a.shape} and {b.shape}"
-    # assert a.is_contiguous(), "Matrix A must be contiguous"
-    # assert b.is_contiguous(), "Matrix B must be contiguous"
 
     batch_dims, K = a.shape[:-1], a.shape[-1]
     M = batch_dims.numel()
     N = b.shape[-1]
 
-    # Dimension is smaller than the minimum block size, fallback to torch.matmul
-    if M < M_MIN or N < N_MIN:
-        return torch.matmul(a, b, out=out)
-
     a = a.reshape(M, K)
 
-    if out is None:
-        out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    out = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     def grid(meta: dict):
         return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
 
     K_ACC_DIV = calculate_k_acc_div(K, VALUES_BLOCK_K[0], k_acc_div_max)
-    # print(f"{a.shape=} {b.shape=} K_ACC_DIV: {K_ACC_DIV}")
     K_IS_DIVISIBLE = K % (VALUES_BLOCK_K[0] * K_ACC_DIV) == 0
+    K_IS_DIVISIBLE &= (M % max(VALUES_BLOCK_M) == 0) and (N % max(VALUES_BLOCK_N) == 0)
 
-    kernel = _matmul_kernel[grid](
+    _matmul_kernel[grid](
         a,
         b,
         out,
@@ -226,29 +186,23 @@ def _split_k_sequential(
         b.stride(1),
         out.stride(0),
         out.stride(1),
+        compute_dtype=tl.float16,
         inner_acc_dtype=tl.float16,
-        outer_acc_dtype=tl.float32,
+        outer_acc_dtype=tl.float16,
         K_ACC_DIV=K_ACC_DIV,
         K_IS_DIVISIBLE=K_IS_DIVISIBLE,
         BLOCK_K=VALUES_BLOCK_K[0],
-        ACTIVATION=activation,
     )
-
-    if dump_ptx:
-        open("dump.ptx", "w").write(kernel.asm["ptx"])
 
     return out.reshape(*batch_dims, N)
 
 
 @_split_k_sequential.register_fake
-def _split_k_sequential_abstract(
+def _(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: Optional[torch.Tensor],
-    out: Optional[torch.Tensor],
-    dump_ptx: bool,
     k_acc_div_max: int,
-    activation: str,
 ) -> torch.Tensor:
     assert a.ndim == 2 and b.ndim == 2, "Input tensors must have 2 dimensions"
     m, k1 = a.shape
@@ -256,19 +210,51 @@ def _split_k_sequential_abstract(
     assert k1 == k2, f"Incompatible contraction dimensions {a.shape} and {b.shape}"
     assert a.device == b.device, "Input tensors must be on the same device"
     if bias is not None:
-        assert bias.ndim == 1, "Bias tensor must have 1 dimension"
-        assert bias.shape[0] == n, f"Incompatible bias dimensions {bias.shape} and {b.shape}"
-
-    if out is not None:
-        assert out.ndim == 2, "Output tensor must have 2 dimensions"
-        assert out.shape == (m, n), f"Incompatible output dimensions {out.shape} and {(m, n)}"
-        assert out.device == a.device, "Output tensor must be on the same device"
-
+        assert bias.ndim == 2, "Bias tensor must be of shape (1, N)"
+        assert bias.shape[0] == 1
+        assert bias.shape[1] == n, f"Incompatible bias dimensions {bias.shape} and {b.shape}"
     return torch.empty((m, n), dtype=a.dtype, device=a.device)
 
 
-@register_flop_formula(torch.ops.gpu_poor.split_k_sequential)
-def split_k_sequential_flop(a_shape, b_shape, bias_shape, *args, **kwargs) -> int:
+def setup_context(ctx, inputs: tuple, output):
+    input, weight, bias, k_acc_div_max = inputs
+    ctx.save_for_backward(input, weight, bias)
+    ctx.k_acc_div_max = k_acc_div_max
+
+
+def backward(ctx, grad_output):
+    input, weight, bias = ctx.saved_tensors
+    grad_input = grad_weight = grad_bias = None
+
+    print(input.shape, weight.shape, grad_output.shape)
+
+    if ctx.needs_input_grad[0]:
+        grad_input = _split_k_sequential(
+            grad_output,
+            weight.T,
+            bias=None,
+            k_acc_div_max=ctx.k_acc_div_max,
+        )
+
+    if ctx.needs_input_grad[1]:
+        grad_weight = _split_k_sequential(
+            input.T,
+            grad_output,
+            bias=None,
+            k_acc_div_max=ctx.k_acc_div_max,
+        )
+
+    if bias is not None and ctx.needs_input_grad[2]:
+        grad_bias = grad_output.sum(0)
+
+    return grad_input, grad_weight, grad_bias, None
+
+
+_split_k_sequential.register_autograd(backward, setup_context=setup_context)
+
+
+@register_flop_formula(torch.ops.gpu_poor._split_k_sequential)
+def _split_k_sequential_flop(a_shape, b_shape, bias_shape, *args, **kwargs) -> int:
     """Count flops for matmul."""
     m, k, n = *a_shape, b_shape[-1]
     flops = 2 * m * n * (k - 1)
@@ -277,6 +263,17 @@ def split_k_sequential_flop(a_shape, b_shape, bias_shape, *args, **kwargs) -> in
     return flops
 
 
-flop_registry[torch.ops.gpu_poor.split_k_sequential] = split_k_sequential_flop
+flop_registry[torch.ops.gpu_poor._split_k_sequential] = _split_k_sequential_flop
 
-split_k_sequential = torch.ops.gpu_poor.split_k_sequential
+_split_k_sequential = torch.ops.gpu_poor._split_k_sequential
+
+
+def split_k_sequential(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    max_k_splits: int = 32,
+) -> torch.Tensor:
+    assert weight.ndim == 2
+    out = _split_k_sequential(x.flatten(0, -2), weight, bias, max_k_splits)
+    return out.view(*x.shape[:-1], weight.shape[1])

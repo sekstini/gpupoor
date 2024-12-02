@@ -1,9 +1,10 @@
 from functools import partial
 
 import torch
+import torch.nn.functional as F
 import triton
 
-import gpu_poor.kernels.matmul as mm
+import gpu_poor.kernels as mm
 
 try:
     import gemm_streamk_transpose
@@ -25,15 +26,16 @@ def to_col_major(x: torch.Tensor) -> torch.Tensor:
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-        x_vals=[256 * i for i in range(1, 32 + 1, 2)],  # Different possible values for `x_name`
-        # x_vals=[4096, 6144, 8192],
+        x_names=["M", "K", "N"],  # Argument names to use as an x-axis for the plot
+        # x_vals=[i for i in range(32, 4096 + 1, 32)],  # Different possible values for `x_name`
+        # x_vals=[(256, 4096, 3072), (256, 3072, 12288), (256, 12288, 3072), (256, 3072, 3072), (256, 3072, 9216)],
+        x_vals=[(512, 2048, 10240), (512, 2048, 6144), (512, 5120, 2048)],
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
         line_vals=[
             "cublas",
-            "triton_16",
-            "triton_4",
+            "triton_32",
+            "triton_8",
             "triton_1",
             *(
                 [
@@ -48,9 +50,9 @@ def to_col_major(x: torch.Tensor) -> torch.Tensor:
         # Label name for the lines
         line_names=[
             "cuBLAS (fp32 acc)",
-            "Triton (fp16 acc, kdiv=32)",
-            "Triton (fp16 acc, kdiv=8)",
-            "Triton (fp16 acc, kdiv=1)",
+            "Triton (fp16 acc, max_k_splits=32)",
+            "Triton (fp16 acc, max_k_splits=8)",
+            "Triton (fp16 acc, max_k_splits=1)",
             *(
                 [
                     "CUTLASS (fp16 acc, splitK=32)",
@@ -81,11 +83,16 @@ def to_col_major(x: torch.Tensor) -> torch.Tensor:
         plot_name="matmul-performance",  # Name for the plot, used also as a file name for saving the plot.
         args={},
         xlabel="Matrix size (M = N = K)",
+        # xlabel="Matrix size (M=4*1024, N, K=3.5N)",
     )
 )
-def benchmark(M, N, K, provider):
+def benchmark(M, K, N, provider):
+    # M = 4 * 1024
+    # K = int(3.5 * N / 128) * 128
+    print(M, K, N, provider)
     a = torch.randn((M, K), device="cuda", dtype=torch.float16)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float16)
+    b = torch.randn((N, K), device="cuda", dtype=torch.float16).T
+    bias = torch.randn(1, N, device="cuda", dtype=torch.float16)
 
     do_bench = partial(
         triton.testing.do_bench,
@@ -94,22 +101,12 @@ def benchmark(M, N, K, provider):
     )
 
     if provider == "cublas":
-        ms, min_ms, max_ms = do_bench(lambda: torch.matmul(a, b))
+        ms, min_ms, max_ms = do_bench(lambda: F.linear(a, b.T, bias))
     elif provider.startswith("triton"):
-        k_acc_div_max = provider.split("_")[-1]
-        k_acc_div_max = int(k_acc_div_max)
+        max_k_splits = provider.split("_")[-1]
+        max_k_splits = int(max_k_splits)
 
-        ms, min_ms, max_ms = do_bench(
-            lambda: mm.split_k_sequential(
-                a,
-                b,
-                bias=None,
-                out=None,
-                dump_ptx=False,
-                k_acc_div_max=k_acc_div_max,
-                activation=None,
-            )
-        )
+        ms, min_ms, max_ms = do_bench(lambda: mm.split_k_sequential(a, b, bias, max_k_splits=max_k_splits))
     elif provider.startswith("cutlass"):
         split_k_slices = provider.split("_")[-1]
         b_col_major = to_col_major(b)
