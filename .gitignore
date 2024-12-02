@@ -3,5 +3,4 @@ benchmarks/
 other/
 .mypy_cache/
 .pytest_cache/
-*.png
 *.egg-info
