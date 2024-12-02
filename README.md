@@ -2,7 +2,7 @@
 
 **This library has not been thoroughly tested yet, and is therefore likely to have bugs, performance issues, and otherwise sharp edges. Production use is not recommended.**
 
-gpu_poor is an experimental library that aims to speed up training and inference on RTX GPUs by up to 2x by using the float16 accumulation mode on the tensor cores. _For enterprise cards like the RTX 6000 Ada or H100 this library will almost certainly not provide any speedups._
+gpu_poor is an experimental library that aims to speed up training and inference on RTX GPUs by up to 2x by using the float16 accumulation mode on the tensor cores. For enterprise cards like the RTX 6000 Ada or H100 this library will almost certainly not provide any speedups.
 
 Switching to float16 accumulation is not a free lunch however, and the rounding errors it introduces can be unacceptably high even for many inference applications. To make matters worse, we cannot apply techniques such as [compensated summation](https://en.wikipedia.org/wiki/Kahan_summation_algorithm) because the added overhead is likely to be larger than any potential speedup.
 
@@ -47,13 +47,15 @@ y = linear(x)
 
 ## Performance
 
-![RTX 4090 square matmul performance](assets/rtx_4090_square_matmul_perf.png)
 RTX 4090 matmul performance on square matrices.
+
+![RTX 4090 square matmul performance](assets/rtx_4090_square_matmul_perf.png)
 
 ## Accuracy
 
-![accuracy](assets/split_k_sequential__error_1x4096x14336.png)
 The accuracy of `split_k_sequential` rises (up to a point) as we increase the number of splits.
+
+![accuracy](assets/split_k_sequential__error_1x4096x14336.png)
 
 ## License
 
