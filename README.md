@@ -2,7 +2,7 @@
 
 **This library has not been thoroughly tested yet, and is therefore likely to have bugs, performance issues, and otherwise sharp edges. Production use is not recommended.**
 
-gpu*poor is an experimental library that aims to speed up training and inference on RTX GPUs by up to 2x by using the float16 accumulation mode on the tensor cores. \_For enterprise cards like the RTX 6000 Ada or H100 this library will almost certainly not provide any speedups.*
+gpu_poor is an experimental library that aims to speed up training and inference on RTX GPUs by up to 2x by using the float16 accumulation mode on the tensor cores. _For enterprise cards like the RTX 6000 Ada or H100 this library will almost certainly not provide any speedups._
 
 Switching to float16 accumulation is not a free lunch however, and the rounding errors it introduces can be unacceptably high even for many inference applications. To make matters worse, we cannot apply techniques such as [compensated summation](https://en.wikipedia.org/wiki/Kahan_summation_algorithm) because the added overhead is likely to be larger than any potential speedup.
 
